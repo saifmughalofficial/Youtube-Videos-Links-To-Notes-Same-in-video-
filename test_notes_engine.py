@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 os.environ["NOTES_CACHE_DIR"] = tempfile.mkdtemp(prefix="l2n_test_")
-for _k in ("NOTES_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "NOTES_MODEL", "GROQ_API_KEY", "GROQ_MODEL"):
+for _k in ("NOTES_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "NOTES_MODEL", "GROQ_API_KEY", "GROQ_MODEL",
+           "OPENROUTER_API_KEY", "OPENROUTER_MODEL"):
     os.environ.pop(_k, None)
 
 import notes_engine as nt  # noqa: E402
@@ -253,6 +254,23 @@ def test_backup_reader_takes_over_when_every_gemini_key_is_used_up(monkeypatch):
     assert out["title"] == "Backup" and [i["text"] for i in out["items"]] == ["Find p", "p = 4"]
     assert sum(1 for c in groq[1][2]["messages"][0]["content"] if c["type"] == "image_url") == 4
     assert "JSON" in groq[1][2]["messages"][0]["content"][0]["text"]
+
+
+def test_order_is_gemini_then_groq_then_openrouter(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_" + "a" * 30)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-" + "c" * 40)
+    monkeypatch.setattr(nt, "BACKUPS", [dict(nt.BACKUPS[0]), dict(nt.BACKUPS[1], models=["vision-model:free"])])
+    daily = Resp(429, {"error": {"message": "limit PerDay"}})
+    dead_key = Resp(401, {"error": {"message": "invalid api key"}})
+    or_ok = Resp(200, {"choices": [{"message": {"content": json.dumps(
+        {"title": "From OpenRouter", "items": [{"type": "answer", "text": "x = 4"}]})}}]})
+    seen = []
+    fake_post(monkeypatch, [daily] * len(nt.DEFAULT_MODELS) + [dead_key, or_ok], seen)
+    out = nt.generate([{"text": "Image 1"}, {"inlineData": {"mimeType": "image/jpeg", "data": "AAAA"}},
+                       {"text": "Copy the writing."}], nt.NOTES_SCHEMA, ["AIza1"])
+    hosts = [("googleapis" if "googleapis" in s[0] else "groq" if "groq.com" in s[0] else "openrouter") for s in seen]
+    assert hosts == ["googleapis"] * len(nt.DEFAULT_MODELS) + ["groq", "openrouter"]
+    assert out["title"] == "From OpenRouter" and out["items"] == [{"type": "answer", "text": "x = 4"}]
 
 
 def test_youtube_reading_never_goes_to_backup(monkeypatch):

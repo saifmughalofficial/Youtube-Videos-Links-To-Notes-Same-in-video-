@@ -511,15 +511,15 @@ def extract_json(text: str) -> dict:
 def generate(parts: list, schema: dict, keys: list[str], models: list[str] | None = None,
              max_tokens: int = 65536, log=None, timeout: int = 300) -> dict:
     """One JSON answer. Gemini first (every key, every model); when all of them are used up or busy,
-    the backup reader (Groq) takes over — except for videos read straight from YouTube, which only Gemini can do."""
+    the backup readers (Groq, then OpenRouter) take over — except for videos read straight from YouTube,
+    which only Gemini can do."""
     try:
         return _gemini_generate(parts, schema, keys, models, max_tokens, log, timeout)
     except (QuotaError, NotesError) as first:
-        backup = get_groq_keys()
-        if not backup or any("fileData" in p for p in parts):
+        if not get_backup_keys() or any("fileData" in p for p in parts):
             raise
         try:
-            return _groq_generate(parts, backup, log)
+            return _backup_generate(parts, log)
         except Exception:
             raise first
 
@@ -602,38 +602,54 @@ def _gemini_generate(parts: list, schema: dict, keys: list[str], models: list[st
     raise NotesError(f"The notes service is not answering right now ({last[:200]}). Please try again in a few minutes.")
 
 
-# --------------------------------------------------------------------------- backup reader (Groq)
+# --------------------------------------------------------------------------- backup readers (Groq, then OpenRouter)
 
-GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODELS = ["qwen/qwen3.8-27b"]     # reads images; env GROQ_MODEL adds/overrides
-GROQ_IMAGES_PER_REQUEST = 4
+# Tried in this order when every Gemini key is used up or busy. Each: env key name, key pattern, models.
+BACKUPS = [
+    {"name": "groq", "url": "https://api.groq.com/openai/v1/chat/completions", "env": "GROQ_API_KEY",
+     "pattern": r"gsk_[A-Za-z0-9]{20,}", "models": ["qwen/qwen3.8-27b"], "model_env": "GROQ_MODEL",
+     "tokens": "max_completion_tokens", "extra": {"response_format": {"type": "json_object"}, "reasoning_format": "hidden"}},
+    {"name": "openrouter", "url": "https://openrouter.ai/api/v1/chat/completions", "env": "OPENROUTER_API_KEY",
+     "pattern": r"sk-or-[A-Za-z0-9-]{20,}", "model_env": "OPENROUTER_MODEL", "tokens": "max_tokens", "extra": {},
+     "models": ["nvidia/nemotron-3.5-super-vl:free", "dots-studio/dots-3-note-preview:free",
+                "google/gemma-4-31b-it:free", "google/gemma-4-26b-a4b-it:free"]},
+]
+GROQ_IMAGES_PER_REQUEST = 4     # pages per backup request
 _JSON_SHAPE = ('\n\nReply with JSON only, exactly this shape: {"title": "...", "items": [{"type": '
                '"heading|text|definition|formula|question|step|answer", "text": "..."}]}')
 
 
-def get_groq_keys() -> list[str]:
+def _provider_keys(p: dict) -> list[str]:
     keys = []
-    for k in re.split(r"[\s,;]+", os.environ.get("GROQ_API_KEY", "")):
-        if re.fullmatch(r"gsk_[A-Za-z0-9]{20,}", k) and k not in keys:
+    for k in re.split(r"[\s,;]+", os.environ.get(p["env"], "")):
+        if re.fullmatch(p["pattern"], k) and k not in keys:
             keys.append(k)
     return keys
 
 
-def get_groq_models() -> list[str]:
-    custom = [m.strip() for m in os.environ.get("GROQ_MODEL", "").split(",") if m.strip()]
-    return custom + [m for m in GROQ_MODELS if m not in custom]
+def _provider_models(p: dict) -> list[str]:
+    custom = [m.strip() for m in os.environ.get(p["model_env"], "").split(",") if m.strip()]
+    return custom + [m for m in p["models"] if m not in custom]
 
 
-def _groq_call(content: list, keys: list[str], log=None) -> dict:
+def get_groq_keys() -> list[str]:
+    return _provider_keys(BACKUPS[0])
+
+
+def get_backup_keys() -> list[str]:
+    return [k for p in BACKUPS for k in _provider_keys(p)]
+
+
+def _backup_call(p: dict, content: list, keys: list[str], log=None) -> dict:
     last = "unknown error"
-    for model in get_groq_models():
+    for model in _provider_models(p):
         for key in keys:
-            extra = {"response_format": {"type": "json_object"}, "reasoning_format": "hidden"}
+            extra = dict(p["extra"])
             for attempt in range(4):
                 body = {"model": model, "messages": [{"role": "user", "content": content}],
-                        "temperature": 0.1, "max_completion_tokens": 8192} | extra
+                        "temperature": 0.1, p["tokens"]: 8192} | extra
                 try:
-                    r = requests.post(GROQ_API, headers={"Authorization": f"Bearer {key}"}, json=body, timeout=180)
+                    r = requests.post(p["url"], headers={"Authorization": f"Bearer {key}"}, json=body, timeout=180)
                 except requests.RequestException as e:
                     last = f"network: {e}"
                     time.sleep(3)
@@ -647,9 +663,9 @@ def _groq_call(content: list, keys: list[str], log=None) -> dict:
                         continue
                 last = f"{r.status_code}: {r.text[:200]}"
                 if log:
-                    log(f"groq {model}: {last}")
+                    log(f"{p['name']} {model}: {last}")
                 low = r.text.lower()
-                if r.status_code == 400 and any(p in low for p in extra):   # setting not accepted: drop it
+                if r.status_code == 400 and any(x in low for x in extra):   # setting not accepted: drop it
                     extra = {k: v for k, v in extra.items() if k not in low}
                     continue
                 if r.status_code == 429:
@@ -657,8 +673,8 @@ def _groq_call(content: list, keys: list[str], log=None) -> dict:
                         wait = float(r.headers.get("retry-after") or 5)
                     except ValueError:
                         wait = 5.0
-                    if key != keys[-1] or wait > 30:
-                        break      # this key is full: the next key
+                    if key != keys[-1] or wait > 30 or attempt >= 1:
+                        break      # this key / model is full: the next one
                     time.sleep(wait)
                     continue
                 if r.status_code in (500, 502, 503, 504):
@@ -668,21 +684,31 @@ def _groq_call(content: list, keys: list[str], log=None) -> dict:
     raise NotesError(f"The backup reader is not answering ({last[:150]}).")
 
 
-def _groq_generate(parts: list, keys: list[str], log=None) -> dict:
-    """The same request for Groq: a few images per call, joined in order."""
+def _backup_generate(parts: list, log=None) -> dict:
+    """The same request for the backup readers: a few images per call, joined in order. Groq first, then OpenRouter."""
     images = [p["inlineData"] for p in parts if "inlineData" in p]
     prompt = "\n\n".join(p["text"] for p in parts if "text" in p and not re.fullmatch(r"Image \d+", p["text"]))
     prompt += _JSON_SHAPE
-    if not images:
-        return _groq_call([{"type": "text", "text": prompt}], keys, log)
-    title, raw = "", []
     step = GROQ_IMAGES_PER_REQUEST
-    for a in range(0, len(images), step):
-        chunk = images[a:a + step]
-        note = f"\n(These are images {a + 1}–{a + len(chunk)} of {len(images)}, in order.)" if len(images) > step else ""
+    chunks = [images[a:a + step] for a in range(0, len(images), step)] or [[]]
+    title, raw = "", []
+    for n, chunk in enumerate(chunks):
+        note = f"\n(These are images {n * step + 1}–{n * step + len(chunk)} of {len(images)}, in order.)" \
+            if len(images) > step else ""
         content = [{"type": "text", "text": prompt + note}] + [
             {"type": "image_url", "image_url": {"url": f"data:{im['mimeType']};base64,{im['data']}"}} for im in chunk]
-        data = _groq_call(content, keys, log)
+        data, last = None, None
+        for p in BACKUPS:
+            keys = _provider_keys(p)
+            if not keys:
+                continue
+            try:
+                data = _backup_call(p, content, keys, log)
+                break
+            except NotesError as e:
+                last = e
+        if data is None:
+            raise last or NotesError("No backup reader is set up.")
         title = title or clean_text(data.get("title") or "")
         raw = join_parts(raw, clean_items(data.get("items")))
     return {"title": title, "items": raw}
@@ -887,7 +913,7 @@ def make_notes(link: str, keys: list[str] | None = None, status=None) -> dict:
     if hit:
         status("Done", 1.0)
         return hit
-    if not keys and not get_groq_keys():
+    if not keys and not get_backup_keys():
         raise NotesError("The notes reader is not switched on yet. (App owner: add the free GEMINI_API_KEY "
                          "in the app's secrets — see README.)")
     status("Opening the lecture", 0.02)

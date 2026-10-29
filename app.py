@@ -19,7 +19,7 @@ st.set_page_config(page_title=nt.APP_NAME, page_icon=":material/edit_note:", lay
 # Keys from Streamlit secrets reach the engine as environment variables.
 try:
     for _k in ("NOTES_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "NOTES_MODEL", "NOTES_WORKERS", "NOTES_MIN_GAP",
-               "GROQ_API_KEY", "GROQ_MODEL"):
+               "GROQ_API_KEY", "GROQ_MODEL", "OPENROUTER_API_KEY", "OPENROUTER_MODEL"):
         if _k in st.secrets and not os.environ.get(_k):
             os.environ[_k] = str(st.secrets[_k])
 except Exception:
@@ -343,7 +343,7 @@ def start(text: str) -> None:
     if not links:
         ss.errors = [(0, text.strip()[:80], "Paste a YouTube video link, for example https://youtu.be/…")]
         return
-    if not (nt.get_keys() or nt.get_groq_keys()):
+    if not (nt.get_keys() or nt.get_backup_keys()):
         ss.errors = [(0, "", "The notes reader is not switched on yet. (App owner: add the free GEMINI_API_KEY "
                              "in the app's secrets — see README.)")]
         return
