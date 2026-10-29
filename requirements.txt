@@ -1,0 +1,8 @@
+streamlit>=1.50
+requests>=2.31
+yt-dlp[default]>=2026.10.26
+deno>=2.0
+opencv-python-headless>=4.9
+numpy
+fpdf2>=2.8
+python-docx>=1.1
