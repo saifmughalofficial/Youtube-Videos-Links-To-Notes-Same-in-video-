@@ -31,9 +31,9 @@ Several keys separated by commas are used in turn (more lectures per day).
 
 ```
 pip install -r requirements.txt
-streamlit run app.py
+streamlit run app.py --server.port 8806
 ```
-Opens on http://localhost:8806.
+Opens on http://localhost:8806. (Don't put the port in `.streamlit/config.toml` — Streamlit Cloud needs its own port.)
 
 ## Deploy on Streamlit Community Cloud
 
@@ -46,5 +46,5 @@ main file `app.py` → add the secret → **Deploy**.
 |---|---|
 | `app.py` | The interface (black theme, splash, About) |
 | `notes_engine.py` | Download, page detection, enhancement, reading, PDF/Word/text export |
-| `test_notes_engine.py` | 41 offline checks incl. a synthetic notebook video: `python -m pytest -q` |
+| `test_notes_engine.py` | 42 offline checks incl. a synthetic notebook video: `python -m pytest -q` |
 | `fonts/` | DejaVu fonts so maths symbols print correctly in the PDF |

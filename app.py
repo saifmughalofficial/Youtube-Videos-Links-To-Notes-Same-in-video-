@@ -1,6 +1,6 @@
 """Youtube Lectures Links To Notes — paste YouTube lecture links, get the teacher's writing as clean notes (PDF / Word / text).
 
-Run:  streamlit run app.py        (opens on http://localhost:8806)
+Run:  streamlit run app.py --server.port 8806        (opens on http://localhost:8806)
 Needs one free Gemini key in .streamlit/secrets.toml (see README).
 """
 import base64
