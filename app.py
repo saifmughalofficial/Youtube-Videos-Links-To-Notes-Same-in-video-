@@ -18,7 +18,7 @@ st.set_page_config(page_title=nt.APP_NAME, page_icon=":material/edit_note:", lay
 
 # Keys from Streamlit secrets reach the engine as environment variables.
 try:
-    for _k in ("NOTES_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "NOTES_MODEL"):
+    for _k in ("NOTES_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "NOTES_MODEL", "NOTES_WORKERS", "NOTES_MIN_GAP"):
         if _k in st.secrets and not os.environ.get(_k):
             os.environ[_k] = str(st.secrets[_k])
 except Exception:
@@ -346,6 +346,8 @@ def start(text: str) -> None:
         ss.errors = [(0, "", "The notes reader is not switched on yet. (App owner: add the free GEMINI_API_KEY "
                              "in the app's secrets — see README.)")]
         return
+    if len(links) > nt.MAX_LINKS:
+        ss.notice = f"Only the first {nt.MAX_LINKS} links are used ({len(links)} were pasted)."
     job = nt.Job(links=links[:nt.MAX_LINKS])
     job_registry()[job.id] = job
     nt.start_job(job)
@@ -364,6 +366,19 @@ def export(notes_json: str, kind: str) -> bytes:
     if kind == "docx":
         return nt.to_docx(n)
     return nt.to_text(n).encode("utf-8")
+
+
+def download_row(notes: dict, key: str) -> None:
+    payload = json.dumps(notes, ensure_ascii=False, sort_keys=True)
+    fname = nt.safe_filename(notes["title"])
+    with st.container(horizontal=True, key=key):
+        st.download_button("PDF", export(payload, "pdf"), f"{fname}.pdf", "application/pdf",
+                           icon=":material/picture_as_pdf:", type="primary", on_click="ignore")
+        st.download_button("Word", export(payload, "docx"), f"{fname}.docx",
+                           "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                           icon=":material/description:", on_click="ignore")
+        st.download_button("Text", export(payload, "txt"), f"{fname}.txt", "text/plain",
+                           icon=":material/notes:", on_click="ignore")
 
 
 def notes_html(n: dict) -> str:
@@ -406,6 +421,8 @@ def link_list(job: nt.Job) -> str:
             state = '<span class="pill ok">done</span>'
         elif f > 0:
             state = f'<span class="pill on">{html.escape(job.stages[i - 1])}</span>'
+        elif "number" in job.stages[i - 1]:
+            state = f'<span class="pill">number {html.escape(job.stages[i - 1].rsplit(" ", 1)[1])} in line</span>'
         else:
             state = '<span class="pill">waiting</span>'
         short = html.escape(link.replace("https://", "").replace("www.", "").split("&")[0])
@@ -482,9 +499,17 @@ if job is not None and not job.done:
             if j.total > 1:
                 st.html(link_list(j))
             mins = int((time.time() - j.started) // 60)
-            st.caption("Keep this tab open. Each lecture takes about a minute or two."
-                       + (f" Running for {mins} min." if mins else ""))
+            st.caption("Each lecture takes a minute or two (long ones a few minutes). You can close this tab and "
+                       "come back later with this page's link." + (f" Running for {mins} min." if mins else ""))
+        ready = nt.combine(j.results)
+        if ready and j.total > 1:            # download what is finished while the rest is still being made
+            n_ready = ready.get("lectures", 1)
+            st.caption(f"Ready now: {n_ready} lecture{'s' if n_ready > 1 else ''} — download "
+                       f"{'them' if n_ready > 1 else 'it'} while the rest are made.")
+            download_row(ready, "ink_dl_part")
 
+    if (notice := ss.pop("notice", None)):
+        st.toast(notice, icon=":material/info:")
     progress_view()
 
 elif job is not None:
@@ -503,16 +528,7 @@ elif job is not None:
     for num, link, err in job.errors:
         st.error(f"**Link {num}** could not be read: {err}  \n`{link}`", icon=":material/error:")
     if notes:
-        payload = json.dumps(notes, ensure_ascii=False, sort_keys=True)
-        fname = nt.safe_filename(notes["title"])
-        with st.container(horizontal=True, key="ink_dl"):
-            st.download_button("PDF", export(payload, "pdf"), f"{fname}.pdf", "application/pdf",
-                               icon=":material/picture_as_pdf:", type="primary", on_click="ignore")
-            st.download_button("Word", export(payload, "docx"), f"{fname}.docx",
-                               "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                               icon=":material/description:", on_click="ignore")
-            st.download_button("Text", export(payload, "txt"), f"{fname}.txt", "text/plain",
-                               icon=":material/notes:", on_click="ignore")
+        download_row(notes, "ink_dl")
         with st.container(border=True, key="ink_notes_box"):
             st.html(notes_html(notes))
 

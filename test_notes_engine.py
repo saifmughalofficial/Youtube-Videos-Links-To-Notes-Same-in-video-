@@ -226,6 +226,14 @@ def test_generate_daily_quota_moves_to_next_key_then_model(monkeypatch):
     assert f"{nt.DEFAULT_MODELS[1]}:" in seen[2][0] and f"{nt.DEFAULT_MODELS[2]}:" in seen[4][0]
 
 
+def test_generate_minute_limit_hands_over_to_next_key(monkeypatch):
+    seen = []
+    fake_post(monkeypatch, [Resp(429, {"error": {"message": "rate", "details": [{"retryDelay": "30s"}]}}),
+                            ok([{"type": "text", "text": "hi"}])], seen)
+    assert nt.generate([{"text": "x"}], nt.NOTES_SCHEMA, ["AIza1", "AIza2"])["items"][0]["text"] == "hi"
+    assert [s[1] for s in seen] == ["AIza1", "AIza2"]
+
+
 def test_generate_all_quota_gone(monkeypatch):
     fake_post(monkeypatch, [Resp(429, {"error": {"message": "limit PerDay"}})] * len(nt.DEFAULT_MODELS))
     with pytest.raises(nt.QuotaError):
@@ -308,6 +316,64 @@ def test_make_notes_messages(monkeypatch):
     monkeypatch.setattr(nt, "generate", lambda *a, **k: (_ for _ in ()).throw(nt.QuotaError("x")))
     with pytest.raises(nt.NotesError, match="tomorrow"):
         nt.make_notes("DDDDDDDDDDD", keys=["AIzaK"])
+
+
+def test_lectures_up_to_two_hours(monkeypatch):
+    monkeypatch.setattr(nt, "get_video_info", lambda vid: dict(INFO, id=vid, duration=2 * 3600 + 60))
+    with pytest.raises(nt.NotesError, match="up to 2 hours"):
+        nt.make_notes("FFFFFFFFFFF", keys=["AIzaK"])
+
+
+def _wait_for(cond, timeout=5.0):
+    import time
+    end = time.time() + timeout
+    while not cond():
+        assert time.time() < end, "timed out"
+        time.sleep(0.01)
+
+
+def test_same_lecture_is_made_once_for_every_student(monkeypatch):
+    import threading
+    gate, calls = threading.Event(), []
+
+    def fake(link, keys, status):
+        calls.append(link)
+        status("Reading the writing", 0.6)
+        gate.wait(5)
+        return dict(SAMPLE, title=f"notes of {nt.parse_video_id(link)}")
+    monkeypatch.setattr(nt, "make_notes", fake)
+    students = [nt.Job(links=["https://youtu.be/GGGGGGGGGGG", f"https://youtu.be/HHHHHHHHHH{k}"]) for k in range(3)]
+    for job in students:
+        nt.start_job(job, [])
+    _wait_for(lambda: all(job.fractions[0] == 0.6 for job in students))   # all see the one running lecture
+    gate.set()
+    _wait_for(lambda: all(job.done for job in students))
+    assert sum(1 for c in calls if "GGGGGGGGGGG" in c) == 1
+    assert all(job.results[0]["title"] == "notes of GGGGGGGGGGG" for job in students)
+    assert [job.results[1]["title"][-1] for job in students] == ["0", "1", "2"]
+
+
+def test_students_take_fair_turns_and_see_their_place(monkeypatch):
+    import threading
+    gate = threading.Event()
+
+    def fake(link, keys, status):
+        if "blk" in link:
+            gate.wait(5)
+        return dict(SAMPLE, title=link)
+    monkeypatch.setattr(nt, "make_notes", fake)
+    nt.start_job(nt.Job(links=[]), [])                        # make sure the workers are running
+    blockers = nt.Job(links=[f"blk{k}" for k in range(len(nt._workers))])
+    nt.start_job(blockers, [])
+    _wait_for(lambda: blockers.id not in nt._pending)          # every worker is busy now
+    big, small = nt.Job(links=["big1", "big2", "big3"]), nt.Job(links=["small1", "small2"])
+    nt.start_job(big, [])
+    nt.start_job(small, [])
+    places = lambda job: [int(s.rsplit(" ", 1)[1]) for s in job.stages]
+    assert places(big) == [1, 3, 5] and places(small) == [2, 4]   # one each, round and round
+    gate.set()
+    _wait_for(lambda: big.done and small.done and blockers.done)
+    assert [r["title"] for r in small.results] == ["small1", "small2"]
 
 
 def test_job_runs_links_in_parallel_and_keeps_order(monkeypatch):
@@ -417,6 +483,20 @@ def test_app_result_view():
     assert "Link 2" in at.error[0].value
     page = _page(at)
     assert "Q1." in page and "p = 40 cents" in page and "2 questions" in page
+    assert [b.proto.label for b in at.get("download_button")] == ["PDF", "Word", "Text"]
+
+
+def test_app_progress_offers_what_is_ready():
+    at = _app()
+    at.session_state["splashed"] = True
+    job = nt.Job(links=["https://youtu.be/AAAAAAAAAAA", "https://youtu.be/BBBBBBBBBBB"])
+    job.results = [dict(SAMPLE), None]
+    job.fractions, job.stages = [1.0, 0.0], ["Done", "Waiting in line · number 3"]
+    nt.JOBS[job.id] = job
+    at.session_state["job_id"] = job.id
+    at.run()
+    assert not at.exception
+    assert "number 3" in _page(at) and any("Ready now: 1 lecture" in c.value for c in at.caption)
     assert [b.proto.label for b in at.get("download_button")] == ["PDF", "Word", "Text"]
 
 

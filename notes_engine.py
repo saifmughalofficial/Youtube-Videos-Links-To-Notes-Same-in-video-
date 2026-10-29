@@ -26,7 +26,6 @@ import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -47,7 +46,9 @@ DEFAULT_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-flash-latest",
 ITEM_TYPES = ["heading", "text", "definition", "formula", "question", "step", "answer"]
 
 MAX_LINKS = 50
-PARALLEL_VIDEOS = 3       # lectures worked on at the same time
+MAX_SECONDS = 2 * 3600    # longest lecture accepted
+WORKERS = 2               # lectures worked on at the same time for ALL users (env NOTES_WORKERS overrides)
+JOB_KEEP_SECONDS = 12 * 3600   # finished jobs stay reachable by their link this long
 IMAGES_PER_REQUEST = 16
 SEGMENT_SECONDS = 600     # direct-from-YouTube fallback: one request per 10 minutes
 OVERLAP_SECONDS = 20
@@ -244,7 +245,7 @@ def enhance(frame, mask=None):
     return buf.tobytes(), frame.shape[1::-1]
 
 
-def board_snapshots(path, progress=None, max_shots: int = 60) -> list[dict]:
+def board_snapshots(path, progress=None, max_shots: int | None = None) -> list[dict]:
     """Stop the video by itself at every moment a page/board is about to be wiped, turned or
     scrolled, keep the fullest still of it (plus a second view where the hand is elsewhere),
     and enhance them for reading.
@@ -255,6 +256,7 @@ def board_snapshots(path, progress=None, max_shots: int = 60) -> list[dict]:
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
     total = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1
     every = max(1, round(fps * (1.0 if total / fps <= 40 * 60 else 2.0)))
+    max_shots = max_shots or max(60, int(total / fps / 60))   # long lectures keep more pages (2 h → 120)
     kernel = np.ones((5, 5), np.uint8)
     shots: list[dict] = []
     best = alt = None
@@ -441,8 +443,12 @@ _dead: dict[tuple[str, str], float] = {}   # (key, model) -> time it ran out of 
 
 
 def _pace(key: str) -> None:
+    try:   # a paid key can go faster: NOTES_MIN_GAP = "0.5" in the secrets
+        gap = float(os.environ.get("NOTES_MIN_GAP") or MIN_GAP_SECONDS)
+    except ValueError:
+        gap = MIN_GAP_SECONDS
     with _call_lock:
-        wait = _last_call.get(key, 0) + MIN_GAP_SECONDS - time.time()
+        wait = _last_call.get(key, 0) + gap - time.time()
         _last_call[key] = time.time() + max(wait, 0)
     if wait > 0:
         time.sleep(wait)
@@ -554,6 +560,8 @@ def generate(parts: list, schema: dict, keys: list[str], models: list[str] | Non
                     if _is_daily(err):
                         _dead[(key, model)] = time.time()
                         break
+                    if key != keys[-1]:
+                        break      # this key is full for the minute: the next key takes the request
                     time.sleep(min(_retry_delay(err) + 2, 65))
                     continue
                 if r.status_code in (500, 502, 503, 504):
@@ -784,6 +792,8 @@ def make_notes(link: str, keys: list[str] | None = None, status=None) -> dict:
     info = get_video_info(vid)
     if info.get("is_live"):
         raise NotesError("This is a live stream. Make notes after the live class has ended.")
+    if (info.get("duration") or 0) > MAX_SECONDS:
+        raise NotesError(f"This lecture is {fmt_time(info['duration'])} long. Lectures of up to 2 hours can be used.")
 
     shots = None
     tmp = Path(tempfile.mkdtemp(prefix="l2n_"))
@@ -829,11 +839,35 @@ class Job:
     errors: list = field(default_factory=list)      # (link number, link, message)
     done: bool = False
     started: float = field(default_factory=time.time)
+    finished_at: float = 0.0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def __post_init__(self):
         self.fractions = [0.0] * len(self.links)
         self.stages = ["Waiting"] * len(self.links)
         self.results = [None] * len(self.links)
+        self._left = len(self.links)
+        self._closed: set[int] = set()
+
+    def _set(self, i: int, stage: str, frac: float) -> None:
+        if self.fractions[i] < 1.0:
+            self.stages[i] = stage
+            self.fractions[i] = max(self.fractions[i], min(max(frac, 0.0), 1.0))
+
+    def _finish(self, i: int, result: dict | None, error: str | None) -> None:
+        with self._lock:
+            if i in self._closed:
+                return
+            self._closed.add(i)
+            self.results[i] = result
+            if error:
+                self.errors.append((i + 1, self.links[i], error))
+            self.stages[i], self.fractions[i] = "Done", 1.0
+            self._left -= 1
+            if self._left <= 0:
+                self.errors.sort()
+                self.finished_at = time.time()
+                self.done = True
 
     @property
     def total(self) -> int:
@@ -850,35 +884,150 @@ class Job:
     @property
     def stage(self) -> str:
         active = [s for s, f in zip(self.stages, self.fractions) if 0 < f < 1]
-        return active[0] if active else ("Done" if self.done else "Starting")
+        if active:
+            return active[0]
+        waiting = [s for s, f in zip(self.stages, self.fractions) if f < 1]
+        return "Done" if self.done else (waiting[0] if waiting else "Starting")
 
 
 JOBS: dict[str, Job] = {}   # all running/finished jobs, so a page refresh can find its job again
 
+# One queue for every user of the app. A few lectures are worked on at a time (so the server never runs
+# out of memory), users take fair turns (one lecture each, round and round), and a lecture asked for by
+# many users at once is made only once — everyone waiting for it gets the same notes.
+
+
+class _Flight:
+    """One video on its way to notes, shared by every (job, link number) that asked for it."""
+
+    def __init__(self, key: str, link: str, keys):
+        self.key, self.link, self.keys = key, link, keys
+        self.subs: list[tuple[Job, int]] = []
+
+    def status(self, stage: str, frac: float) -> None:
+        for job, i in list(self.subs):
+            job._set(i, stage, frac)
+
+
+_q_lock = threading.Condition()
+_flights: dict[str, _Flight] = {}          # video → queued or running flight
+_pending: dict[str, list[_Flight]] = {}    # job id → its flights that have not started yet
+_turns: list[str] = []                     # job ids, round-robin order
+_workers: list[threading.Thread] = []
+
+
+def _worker_count() -> int:
+    try:
+        return max(1, int(os.environ.get("NOTES_WORKERS") or WORKERS))
+    except ValueError:
+        return WORKERS
+
+
+def _renumber() -> None:
+    """Tell every waiting link its place in the line (caller holds _q_lock)."""
+    queues = {jid: list(_pending.get(jid) or []) for jid in _turns}
+    order, place = list(_turns), 0
+    while order:
+        jid = order.pop(0)
+        if queues[jid]:
+            place += 1
+            f = queues[jid].pop(0)
+            for job, i in f.subs:
+                if job.fractions[i] == 0:
+                    job.stages[i] = f"Waiting in line · number {place}"
+            if queues[jid]:
+                order.append(jid)
+
+
+def _next_flight() -> _Flight | None:
+    while _turns:
+        jid = _turns.pop(0)
+        q = _pending.get(jid)
+        if not q:
+            _pending.pop(jid, None)
+            continue
+        f = q.pop(0)
+        if q:
+            _turns.append(jid)       # back of the line for its next lecture
+        else:
+            _pending.pop(jid, None)
+        _renumber()
+        return f
+    return None
+
+
+def _run_flight(f: _Flight) -> None:
+    result = error = None
+    try:
+        result = make_notes(f.link, f.keys, f.status)
+    except NotesError as e:
+        error = str(e)
+    except Exception as e:  # never leave the student with a frozen screen
+        error = f"Something went wrong with this video ({type(e).__name__}). Please try again."
+    with _q_lock:
+        _flights.pop(f.key, None)
+        subs = list(f.subs)
+    for job, i in subs:
+        job._finish(i, result, error)
+
+
+def _worker() -> None:
+    while True:
+        with _q_lock:
+            f = _next_flight()
+            while f is None:
+                _q_lock.wait()
+                f = _next_flight()
+        _run_flight(f)
+
+
+def _prune_jobs() -> None:
+    old = time.time() - JOB_KEEP_SECONDS
+    for jid in [j for j, job in JOBS.items() if job.done and job.finished_at and job.finished_at < old]:
+        JOBS.pop(jid, None)
+
+
+def start_job(job: Job, keys: list[str] | None = None) -> None:
+    """Put a job's links in the shared line. Cached lectures are filled in at once."""
+    _prune_jobs()
+    cached = []
+    with _q_lock:
+        for i, link in enumerate(job.links):
+            vid = parse_video_id(link)
+            hit = load_cached(vid) if vid else None
+            if hit:
+                cached.append((i, hit))
+                continue
+            key = vid or f"link:{link}"
+            f = _flights.get(key)
+            if f is None:
+                f = _flights[key] = _Flight(key, link, keys)
+                _pending.setdefault(job.id, []).append(f)
+            f.subs.append((job, i))
+            job.stages[i] = "Waiting in line"
+        if _pending.get(job.id) and job.id not in _turns:
+            _turns.append(job.id)
+        _renumber()
+        _workers[:] = [t for t in _workers if t.is_alive()]
+        while len(_workers) < _worker_count():
+            t = threading.Thread(target=_worker, daemon=True, name=f"notes-worker-{len(_workers) + 1}")
+            t.start()
+            _workers.append(t)
+        _q_lock.notify_all()
+    for i, hit in cached:
+        job._finish(i, hit, None)
+    if not job.links:
+        job.done = True
+
 
 def run_job(job: Job, keys: list[str] | None = None) -> None:
-    def one(i: int) -> None:
-        def status(stage, frac):
-            job.stages[i] = stage
-            job.fractions[i] = max(job.fractions[i], min(max(frac, 0.0), 1.0))
-        try:
-            job.results[i] = make_notes(job.links[i], keys, status)
-        except NotesError as e:
-            job.errors.append((i + 1, job.links[i], str(e)))
-        except Exception as e:  # never leave the student with a frozen screen
-            job.errors.append((i + 1, job.links[i], f"Something went wrong with this video ({type(e).__name__}). Please try again."))
-        job.fractions[i] = 1.0
-
-    with ThreadPoolExecutor(max_workers=PARALLEL_VIDEOS) as pool:
-        list(pool.map(one, range(job.total)))
-    job.errors.sort()
-    job.done = True
+    """start_job, then wait until every link is finished."""
+    start_job(job, keys)
+    while not job.done:
+        _sleep(0.02)
 
 
-def start_job(job: Job, keys: list[str] | None = None) -> threading.Thread:
-    t = threading.Thread(target=run_job, args=(job, keys), daemon=True)
-    t.start()
-    return t
+_sleep = time.sleep
 
 
 def combine(results: list[dict]) -> dict | None:

@@ -14,8 +14,23 @@ No talk, no pictures, no links, no sign-up for students.
 4. A free vision model (Google Gemini) reads the stills and writes out the question statements and
    every solution line exactly as written. Blurry digits are decided using the maths itself. Nothing
    is solved, added or summarised.
-5. Up to 3 lectures are processed at once; all of them end up in one document, in link order.
-   Finished lectures are cached, so a repeated link is instant.
+5. All lectures end up in one document, in link order. Finished lectures are cached, so a repeated
+   link is instant.
+
+## Built for a whole class (100 students)
+
+- Up to **50 links** per paste; lectures up to **2 hours** long.
+- **One shared line** for every user: only a few lectures are worked on at once (`NOTES_WORKERS`,
+  default 2), so the free server never runs out of memory.
+- **Fair turns:** users are served one lecture each, round and round — a 50-link paste never blocks
+  a 2-link paste. Each link shows its place in the line.
+- **Each lecture is made once:** if 60 students paste the same lecture, it is read once and all 60 get it.
+- **Download what's ready:** finished lectures can be downloaded while the rest are still being made.
+- **Come back later:** the page link holds the job for 12 hours, so the tab can be closed.
+- **Several keys:** `GEMINI_API_KEY = "key1,key2"`; a key that is full for the minute hands the request
+  to the next one.
+- With a paid (billing-enabled) key, add `NOTES_MIN_GAP = "0.5"` and `NOTES_WORKERS = "3"` to the secrets
+  for faster reading.
 
 If YouTube blocks the download on a server, the model watches the video straight from YouTube instead.
 
