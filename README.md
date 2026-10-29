@@ -29,6 +29,9 @@ No talk, no pictures, no links, no sign-up for students.
 - **Come back later:** the page link holds the job for 12 hours, so the tab can be closed.
 - **Several keys:** `GEMINI_API_KEY = "key1,key2"`; a key that is full for the minute hands the request
   to the next one.
+- **Backup reader:** add `GROQ_API_KEY = "gsk_…,gsk_…"` (free at console.groq.com). When every Gemini key is
+  used up or busy, the pages are read by Groq (`qwen/qwen3.8-27b`, a few pages per request) instead.
+  Videos that can't be downloaded are read straight from YouTube, which only Gemini can do.
 - With a paid (billing-enabled) key, add `NOTES_MIN_GAP = "0.5"` and `NOTES_WORKERS = "3"` to the secrets
   for faster reading.
 

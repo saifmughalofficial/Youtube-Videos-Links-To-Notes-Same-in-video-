@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 os.environ["NOTES_CACHE_DIR"] = tempfile.mkdtemp(prefix="l2n_test_")
-for _k in ("NOTES_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "NOTES_MODEL"):
+for _k in ("NOTES_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "NOTES_MODEL", "GROQ_API_KEY", "GROQ_MODEL"):
     os.environ.pop(_k, None)
 
 import notes_engine as nt  # noqa: E402
@@ -232,6 +232,34 @@ def test_generate_minute_limit_hands_over_to_next_key(monkeypatch):
                             ok([{"type": "text", "text": "hi"}])], seen)
     assert nt.generate([{"text": "x"}], nt.NOTES_SCHEMA, ["AIza1", "AIza2"])["items"][0]["text"] == "hi"
     assert [s[1] for s in seen] == ["AIza1", "AIza2"]
+
+
+def test_backup_reader_takes_over_when_every_gemini_key_is_used_up(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_" + "a" * 30 + ",gsk_" + "b" * 30)
+    daily = Resp(429, {"error": {"message": "limit PerDay"}})
+    groq_full = Resp(429, {"error": {"message": "rate limit"}})
+    groq_ok = lambda items: Resp(200, {"choices": [{"message": {"content": "<think>hmm {x}</think>" + json.dumps(
+        {"title": "Backup", "items": items})}}]})
+    seen = []
+    fake_post(monkeypatch, [daily] * len(nt.DEFAULT_MODELS) + [groq_full,
+              groq_ok([{"type": "question", "text": "Q1. Find p"}]), groq_ok([{"type": "step", "text": "p = 4"}])], seen)
+    parts = []
+    for k in range(6):                                   # 6 pages → 2 backup calls of 4 + 2 images
+        parts += [{"text": f"Image {k + 1}"}, {"inlineData": {"mimeType": "image/jpeg", "data": "AAAA"}}]
+    parts.append({"text": "Copy the writing."})
+    out = nt.generate(parts, nt.NOTES_SCHEMA, ["AIza1"])
+    groq = [s for s in seen if "groq.com" in s[0]]
+    assert len(groq) == 3                                # first key full → second key, then the next chunk
+    assert out["title"] == "Backup" and [i["text"] for i in out["items"]] == ["Find p", "p = 4"]
+    assert sum(1 for c in groq[1][2]["messages"][0]["content"] if c["type"] == "image_url") == 4
+    assert "JSON" in groq[1][2]["messages"][0]["content"][0]["text"]
+
+
+def test_youtube_reading_never_goes_to_backup(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_" + "a" * 30)
+    fake_post(monkeypatch, [Resp(429, {"error": {"message": "limit PerDay"}})] * len(nt.DEFAULT_MODELS))
+    with pytest.raises(nt.QuotaError):
+        nt.generate([{"fileData": {"fileUri": "https://youtu.be/x"}}, {"text": "x"}], nt.NOTES_SCHEMA, ["AIza1"])
 
 
 def test_generate_all_quota_gone(monkeypatch):

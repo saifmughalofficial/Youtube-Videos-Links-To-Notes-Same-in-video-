@@ -510,6 +510,22 @@ def extract_json(text: str) -> dict:
 
 def generate(parts: list, schema: dict, keys: list[str], models: list[str] | None = None,
              max_tokens: int = 65536, log=None, timeout: int = 300) -> dict:
+    """One JSON answer. Gemini first (every key, every model); when all of them are used up or busy,
+    the backup reader (Groq) takes over — except for videos read straight from YouTube, which only Gemini can do."""
+    try:
+        return _gemini_generate(parts, schema, keys, models, max_tokens, log, timeout)
+    except (QuotaError, NotesError) as first:
+        backup = get_groq_keys()
+        if not backup or any("fileData" in p for p in parts):
+            raise
+        try:
+            return _groq_generate(parts, backup, log)
+        except Exception:
+            raise first
+
+
+def _gemini_generate(parts: list, schema: dict, keys: list[str], models: list[str] | None = None,
+                     max_tokens: int = 65536, log=None, timeout: int = 300) -> dict:
     """One JSON answer from the first key/model that works. Handles limits and retries."""
     models = models or get_models()
     if not keys:
@@ -584,6 +600,92 @@ def generate(parts: list, schema: dict, keys: list[str], models: list[str] | Non
     if "429" in last or not any(time.time() - _dead.get((k, m), 0) >= 3600 for k in keys for m in models):
         raise QuotaError(last)
     raise NotesError(f"The notes service is not answering right now ({last[:200]}). Please try again in a few minutes.")
+
+
+# --------------------------------------------------------------------------- backup reader (Groq)
+
+GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELS = ["qwen/qwen3.8-27b"]     # reads images; env GROQ_MODEL adds/overrides
+GROQ_IMAGES_PER_REQUEST = 4
+_JSON_SHAPE = ('\n\nReply with JSON only, exactly this shape: {"title": "...", "items": [{"type": '
+               '"heading|text|definition|formula|question|step|answer", "text": "..."}]}')
+
+
+def get_groq_keys() -> list[str]:
+    keys = []
+    for k in re.split(r"[\s,;]+", os.environ.get("GROQ_API_KEY", "")):
+        if re.fullmatch(r"gsk_[A-Za-z0-9]{20,}", k) and k not in keys:
+            keys.append(k)
+    return keys
+
+
+def get_groq_models() -> list[str]:
+    custom = [m.strip() for m in os.environ.get("GROQ_MODEL", "").split(",") if m.strip()]
+    return custom + [m for m in GROQ_MODELS if m not in custom]
+
+
+def _groq_call(content: list, keys: list[str], log=None) -> dict:
+    last = "unknown error"
+    for model in get_groq_models():
+        for key in keys:
+            extra = {"response_format": {"type": "json_object"}, "reasoning_format": "hidden"}
+            for attempt in range(4):
+                body = {"model": model, "messages": [{"role": "user", "content": content}],
+                        "temperature": 0.1, "max_completion_tokens": 8192} | extra
+                try:
+                    r = requests.post(GROQ_API, headers={"Authorization": f"Bearer {key}"}, json=body, timeout=180)
+                except requests.RequestException as e:
+                    last = f"network: {e}"
+                    time.sleep(3)
+                    continue
+                if r.status_code == 200:
+                    text = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                    try:
+                        return extract_json(re.sub(r"<think>.*?</think>", "", text, flags=re.S))
+                    except ValueError:
+                        last = "unreadable answer"
+                        continue
+                last = f"{r.status_code}: {r.text[:200]}"
+                if log:
+                    log(f"groq {model}: {last}")
+                low = r.text.lower()
+                if r.status_code == 400 and any(p in low for p in extra):   # setting not accepted: drop it
+                    extra = {k: v for k, v in extra.items() if k not in low}
+                    continue
+                if r.status_code == 429:
+                    try:
+                        wait = float(r.headers.get("retry-after") or 5)
+                    except ValueError:
+                        wait = 5.0
+                    if key != keys[-1] or wait > 30:
+                        break      # this key is full: the next key
+                    time.sleep(wait)
+                    continue
+                if r.status_code in (500, 502, 503, 504):
+                    time.sleep(3)
+                    continue
+                break              # bad key / model not offered: next one
+    raise NotesError(f"The backup reader is not answering ({last[:150]}).")
+
+
+def _groq_generate(parts: list, keys: list[str], log=None) -> dict:
+    """The same request for Groq: a few images per call, joined in order."""
+    images = [p["inlineData"] for p in parts if "inlineData" in p]
+    prompt = "\n\n".join(p["text"] for p in parts if "text" in p and not re.fullmatch(r"Image \d+", p["text"]))
+    prompt += _JSON_SHAPE
+    if not images:
+        return _groq_call([{"type": "text", "text": prompt}], keys, log)
+    title, raw = "", []
+    step = GROQ_IMAGES_PER_REQUEST
+    for a in range(0, len(images), step):
+        chunk = images[a:a + step]
+        note = f"\n(These are images {a + 1}–{a + len(chunk)} of {len(images)}, in order.)" if len(images) > step else ""
+        content = [{"type": "text", "text": prompt + note}] + [
+            {"type": "image_url", "image_url": {"url": f"data:{im['mimeType']};base64,{im['data']}"}} for im in chunk]
+        data = _groq_call(content, keys, log)
+        title = title or clean_text(data.get("title") or "")
+        raw = join_parts(raw, clean_items(data.get("items")))
+    return {"title": title, "items": raw}
 
 
 # --------------------------------------------------------------------------- prompts
@@ -785,7 +887,7 @@ def make_notes(link: str, keys: list[str] | None = None, status=None) -> dict:
     if hit:
         status("Done", 1.0)
         return hit
-    if not keys:
+    if not keys and not get_groq_keys():
         raise NotesError("The notes reader is not switched on yet. (App owner: add the free GEMINI_API_KEY "
                          "in the app's secrets — see README.)")
     status("Opening the lecture", 0.02)
