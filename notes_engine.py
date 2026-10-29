@@ -1005,8 +1005,10 @@ class _Flight:
     def __init__(self, key: str, link: str, keys):
         self.key, self.link, self.keys = key, link, keys
         self.subs: list[tuple[Job, int]] = []
+        self.last: tuple[str, float] | None = None    # latest progress, for users who join while it runs
 
     def status(self, stage: str, frac: float) -> None:
+        self.last = (stage, frac)
         for job, i in list(self.subs):
             job._set(i, stage, frac)
 
@@ -1107,6 +1109,8 @@ def start_job(job: Job, keys: list[str] | None = None) -> None:
                 _pending.setdefault(job.id, []).append(f)
             f.subs.append((job, i))
             job.stages[i] = "Waiting in line"
+            if f.last:                       # already being made for someone else: show its progress now
+                job._set(i, *f.last)
         if _pending.get(job.id) and job.id not in _turns:
             _turns.append(job.id)
         _renumber()
